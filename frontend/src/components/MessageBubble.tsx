@@ -32,7 +32,7 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, sender }) => {
     return (
       <div className="flex justify-start mb-4">
         <div className="max-w-[85%]">
-          <ProviderCard provider={mockProvider} />
+          {/* <ProviderCard provider={mockProvider} /> */}
           <span className="text-xs text-gray-500 mt-1 block text-left">
             {formatTimestamp(message.timestamp)}
           </span>

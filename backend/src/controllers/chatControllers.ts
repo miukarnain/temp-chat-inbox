@@ -229,8 +229,10 @@ export const getMockUsers = async (req: Request, res: Response): Promise<void> =
   }
 };
 
-export const getMessageHistory = async (req: Request<{}, {}, GetMessageHistoryRequest>, res: Response): Promise<void> => {
-  // Extract variables at the top level so they're available in catch block
+// Create a REST client instance (you might want to reuse this)
+const ablyRest = new Ably.Rest({ key: process.env.ABLY_API_KEY });
+
+export const getMessageHistory = async (req: Request, res: Response): Promise<void> => {
   const { channelName, limit = 50, direction = 'backwards' } = req.body;
 
   if (!channelName) {
@@ -239,46 +241,86 @@ export const getMessageHistory = async (req: Request<{}, {}, GetMessageHistoryRe
   }
 
   try {
-    // Get channel from Ably
-    const channel = ably.channels.get(channelName);
+    // Get channel from Ably REST client
+    const channel = ablyRest.channels.get(channelName);
+    console.log("Fetching history for channel:", channelName);
 
-    // Use type assertion to handle Ably's incorrect TypeScript definitions
-    const historyPage = await (channel.history as any)({
-      limit: Math.min(limit, 100), // Cap at 100 messages max
-      direction: direction
+    // Use the REST client's history method with better error handling
+    const historyResult = await new Promise<any>((resolve, reject) => {
+      channel.history({
+        limit: Math.min(limit, 100),
+        direction: direction
+      }, (err, resultPage) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(resultPage);
+        }
+      });
     });
 
     // Check if we got a valid response
-    if (!historyPage) {
-      throw new Error('No response from Ably history');
+    if (!historyResult) {
+      throw new Error('Ably history returned undefined response');
     }
 
-    // Extract items and hasNext from the response
-    const ablyMessages = historyPage.items || [];
-    const hasMore = typeof historyPage.hasNext === 'function' ? historyPage.hasNext() : false;
+    // Type the history page properly
+    interface HistoryPage {
+      items: Array<{
+        id: string;
+        data: any;
+        timestamp: number;
+        name?: string;
+        clientId?: string;
+      }>;
+      hasNext?: () => Promise<boolean> | boolean;
+      next?: () => Promise<HistoryPage | null>;
+    }
 
-    // Convert Ably messages to our Message format
-    const messages: Message[] = ablyMessages.map((ablyMessage: any) => {
-      const messageData = ablyMessage.data;
-      return {
-        id: ablyMessage.id || uuidv4(),
-        senderId: messageData.senderId,
-        senderName: messageData.senderName,
-        content: messageData.content,
-        messageType: messageData.messageType || 'text',
-        timestamp: new Date(ablyMessage.timestamp).toISOString(),
-        read: messageData.read || false,
-        options: messageData.options
-      };
+    const historyPage = historyResult as HistoryPage;
+
+    // Extract items from the history page with safe fallback
+    const ablyMessages = historyPage.items || [];
+    console.log(`Found ${ablyMessages.length} historical messages for channel ${channelName}`);
+
+    // Convert Ably messages to your Message format
+    const messages: Message[] = ablyMessages.map((ablyMessage) => {
+      try {
+        // Handle different message data formats
+        const messageData = ablyMessage.data || {};
+        
+        return {
+          id: ablyMessage.id || uuidv4(),
+          senderId: messageData.senderId || ablyMessage.clientId || 'unknown',
+          senderName: messageData.senderName || 'Unknown User',
+          content: messageData.content || '',
+          messageType: messageData.messageType || 'text',
+          timestamp: new Date(ablyMessage.timestamp || Date.now()).toISOString(),
+          read: messageData.read || false,
+          options: messageData.options || {}
+        };
+      } catch (parseError) {
+        console.error('Error parsing message:', ablyMessage, parseError);
+        // Return a fallback message for corrupted data
+        return {
+          id: uuidv4(),
+          senderId: 'system',
+          senderName: 'System',
+          content: 'Unable to load message',
+          messageType: 'error',
+          timestamp: new Date().toISOString(),
+          read: true,
+          options: {}
+        };
+      }
     });
 
-    // If direction is backwards (most recent first), reverse to get chronological order
+    // If direction is backwards, reverse to get chronological order
     const sortedMessages = direction === 'backwards' ? messages.reverse() : messages;
 
-    // Update local channel cache with historical messages
+    // Update local channel cache
     const channelInfo = activeChannels.get(channelName);
     if (channelInfo) {
-      // Merge historical messages with existing ones, avoiding duplicates
       const existingMessageIds = new Set(channelInfo.messages.map(msg => msg.id));
       const newMessages = sortedMessages.filter(msg => !existingMessageIds.has(msg.id));
       channelInfo.messages = [...newMessages, ...channelInfo.messages].sort(
@@ -287,36 +329,56 @@ export const getMessageHistory = async (req: Request<{}, {}, GetMessageHistoryRe
       activeChannels.set(channelName, channelInfo);
     }
 
+    // Check if there are more messages (with safe fallback)
+    let hasMore = false;
+    try {
+      if (historyPage.hasNext && typeof historyPage.hasNext === 'function') {
+        hasMore = await Promise.resolve(historyPage.hasNext());
+      }
+    } catch (hasNextError) {
+      console.warn('Error checking hasNext:', hasNextError);
+      hasMore = false;
+    }
+
     res.status(200).json({
       success: true,
       messages: sortedMessages,
-      hasMore
-    } as MessageHistoryResponse);
+      hasMore,
+      totalCount: sortedMessages.length
+    });
 
   } catch (error) {
     console.error('Error fetching message history:', error);
     
-    // Fallback to local storage if Ably history fails
+    // Enhanced fallback logic with better debugging
+    console.log('Attempting fallback to local storage for channel:', channelName);
+    
     try {
       const channelInfo = activeChannels.get(channelName);
-      if (channelInfo) {
+      if (channelInfo && channelInfo.messages.length > 0) {
         const localMessages = channelInfo.messages
           .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
           .slice(-limit);
         
+        console.log(`Fallback: Found ${localMessages.length} local messages for channel ${channelName}`);
+        
         res.status(200).json({
           success: true,
           messages: localMessages,
-          hasMore: false
-        } as MessageHistoryResponse);
+          hasMore: false,
+          fallback: true,
+          totalCount: localMessages.length
+        });
         return;
       } else {
-        // If no local channel info, return empty array
+        console.log(`Fallback: No local messages found for channel ${channelName}`);
         res.status(200).json({
           success: true,
           messages: [],
-          hasMore: false
-        } as MessageHistoryResponse);
+          hasMore: false,
+          fallback: true,
+          totalCount: 0
+        });
         return;
       }
     } catch (fallbackError) {
@@ -325,8 +387,11 @@ export const getMessageHistory = async (req: Request<{}, {}, GetMessageHistoryRe
       res.status(200).json({
         success: true,
         messages: [],
-        hasMore: false
-      } as MessageHistoryResponse);
+        hasMore: false,
+        fallback: true,
+        totalCount: 0,
+        error: 'Both Ably and fallback failed'
+      });
     }
   }
 };

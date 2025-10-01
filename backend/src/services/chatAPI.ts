@@ -51,7 +51,14 @@ export const chatAPI = {
     const response = await fetch(`${API_BASE}/message`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      // body: JSON.stringify(data),
+      body: JSON.stringify({
+                persistence: {
+                  enabled: true,
+                  persistUntil: Date.now() + (72 * 60 * 60 * 1000) // 72 hours
+                },
+                ...data 
+              })
     });
 
     if (!response.ok) {
