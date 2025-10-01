@@ -27,7 +27,7 @@ export default function ChatPage() {
   const generateChannelName = (userId: string, userName: string): string => {
     const sanitizedUserId = userId.toLowerCase().replace(/[^a-z0-9]/g, '');
     const sanitizedUserName = userName.toLowerCase().replace(/[^a-z0-9]/g, '');
-    return `${sanitizedUserId}_${sanitizedUserName}_toothsomeChatBot`;
+    return `${process.env.CHANNEL_NAME_SPACE}${sanitizedUserId}_${sanitizedUserName}_toothsomeChatBot`;
   };
  
   // Helper function to determine current step from messages
